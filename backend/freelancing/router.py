@@ -1,7 +1,9 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from backend.ai_engine import model_client, prompt_engine
-from backend.database import db
+from backend.database import AsyncSessionLocal
+from backend.database.models import Proposal as ProposalModel
+from sqlalchemy import select
 import logging
 
 logger = logging.getLogger("freelancing.router")
@@ -29,19 +31,42 @@ async def generate_proposal(payload: ProposalRequest):
     try:
         text = model_client.generate_text(prompt, max_tokens=512)
     except Exception as e:
-        logger.exception("Model generation failed")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Model generation failed, using deterministic fallback: %s", e)
+        text = prompt_engine.render_proposal_template(payload.client_name, payload.project_summary, payload.budget)
 
-    # Optionally save to DB (stub)
+    # Save to DB (async)
     try:
-        # db.save_proposal(...)  # implement persistence as needed
-        pass
+        async with AsyncSessionLocal() as session:
+            async with session.begin():
+                proposal = ProposalModel(
+                    client_name=payload.client_name,
+                    project_summary=payload.project_summary,
+                    proposal_text=text,
+                )
+                session.add(proposal)
     except Exception:
-        logger.exception("Failed to save proposal to DB (not implemented)")
+        logger.exception("Failed to save proposal to DB")
 
     return {"proposal": text}
 
 
-@router.get("/discover/sample")
-async def discover_sample():
-    return {"message": "Client discovery module not implemented yet. Add crawler/integration to enable."}
+@router.get("/proposals")
+async def list_proposals(limit: int = 50):
+    """List recent proposals saved in the DB."""
+    try:
+        async with AsyncSessionLocal() as session:
+            result = await session.execute(select(ProposalModel).order_by(ProposalModel.created_at.desc()).limit(limit))
+            rows = result.scalars().all()
+            items = [
+                {
+                    "id": r.id,
+                    "client_name": r.client_name,
+                    "project_summary": r.project_summary,
+                    "created_at": r.created_at.isoformat() if r.created_at else None,
+                }
+                for r in rows
+            ]
+            return {"proposals": items}
+    except Exception as e:
+        logger.exception("Failed to list proposals: %s", e)
+        raise HTTPException(status_code=500, detail="DB error")
