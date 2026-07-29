@@ -1,28 +1,26 @@
 """
-Simple model client with local-quantized fallback.
-
-This module attempts to load a local quantized model (AutoGPTQ / transformers) when
-MODEL_MODE=local and MODEL_PATH is provided. For 8GB RAM machines you will likely
-need an 4-bit quantized model and CPU-optimized runtime (ex: GGML/llama.cpp or
-AutoGPTQ with bnb on CPU). Getting Qwen3.5:4B quantized artifacts requires
-following the model's quantization guide (not included here).
-
-If local loading fails, the client will try to fall back to a remote provider if
-configured (not implemented automatically here).
+Enhanced model client with OpenAI remote fallback when local model is not available.
+This keeps the existing local transformers loader but will call OpenAI's Chat Completions
+API when MODEL_MODE!=local or local loading fails and OPENAI_API_KEY is set.
 """
 from typing import Optional
 import os
 import logging
+import json
+
+import httpx
 
 logger = logging.getLogger("model_client")
 
 MODEL_MODE = os.getenv("MODEL_MODE", "local")
 MODEL_PATH = os.getenv("MODEL_PATH", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
 
 # Lazy imports — keep startup fast when dependencies not installed
 _transformers_available = False
 try:
-    import torch
+    import torch  # noqa: F401
     from transformers import AutoTokenizer, AutoModelForCausalLM, pipeline
     _transformers_available = True
 except Exception:
@@ -38,10 +36,6 @@ class LocalModel:
     def _load(self):
         if not _transformers_available:
             raise RuntimeError("transformers/torch not available in environment")
-        # NOTE: For quantized models you might need AutoGPTQ or custom loading.
-        # Here we try a standard transformers pipeline which will work for
-        # non-quantized models or if the quantized model is supported by the
-        # installed libs.
         logger.info("Loading local model from %s", self.model_path)
         try:
             tokenizer = AutoTokenizer.from_pretrained(self.model_path, use_fast=True)
@@ -56,8 +50,7 @@ class LocalModel:
         if self.pipe is None:
             raise RuntimeError("Model pipeline not initialized")
         out = self.pipe(prompt, max_new_tokens=max_tokens, do_sample=False, **kwargs)
-        # pipeline returns a list of generation dicts
-        return out[0]["generated_text"]
+        return out[0].get("generated_text", "")
 
 
 # Global client holder
@@ -75,16 +68,60 @@ def get_client() -> Optional[LocalModel]:
         except Exception:
             logger.exception("Local model load failed")
             _client = None
-    # Future: fallback to remote provider if configured
     return None
 
 
-def generate_text(prompt: str, max_tokens: int = 256) -> str:
-    """Generate text using local model if available, else raise informative error.
+# Remote OpenAI fallback
+async def _openai_generate_async(prompt: str, max_tokens: int = 256) -> str:
+    """Call OpenAI Chat Completions API via httpx (async).
+    Requires OPENAI_API_KEY env var to be set.
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY not configured for remote generation")
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "temperature": 0.0,
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        r = await client.post(url, headers=headers, json=payload)
+        r.raise_for_status()
+        data = r.json()
+        # Extract assistant content
+        try:
+            return data["choices"][0]["message"]["content"]
+        except Exception:
+            logger.exception("Unexpected OpenAI response: %s", data)
+            raise RuntimeError("OpenAI returned unexpected response")
 
-    For production you should implement a remote API fallback and better error handling.
+
+def _openai_generate(prompt: str, max_tokens: int = 256) -> str:
+    # sync wrapper
+    import asyncio
+    return asyncio.run(_openai_generate_async(prompt, max_tokens=max_tokens))
+
+
+def generate_text(prompt: str, max_tokens: int = 256) -> str:
+    """Generate text using local model if available, else try OpenAI remote fallback.
+
+    Raises RuntimeError if no model available.
     """
     client = get_client()
     if client:
-        return client.generate(prompt, max_tokens=max_tokens)
-    raise RuntimeError("No model available. Configure a local quantized model or remote API.")
+        try:
+            return client.generate(prompt, max_tokens=max_tokens)
+        except Exception:
+            logger.exception("Local model generation failed, attempting remote fallback")
+    # Try remote OpenAI fallback if key is present
+    if OPENAI_API_KEY:
+        try:
+            return _openai_generate(prompt, max_tokens=max_tokens)
+        except Exception:
+            logger.exception("OpenAI generation failed")
+    raise RuntimeError("No model available. Configure a local quantized model or set OPENAI_API_KEY for remote generation.")
